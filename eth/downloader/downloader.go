@@ -78,11 +78,16 @@ var (
 	errCanceled                = errors.New("syncing canceled (requested)")
 	errTooOld                  = errors.New("peer's protocol version too old")
 	errNoAncestorFound         = errors.New("no common ancestor found")
+	errNoPivotHeader           = errors.New("pivot header is not found")
 	ErrMergeTransition         = errors.New("legacy sync reached the merge")
 )
 
 // peerDropFn is a callback type for dropping a peer detected as malicious.
 type peerDropFn func(id string)
+
+// badBlockFn is a callback for the async beacon sync to notify the caller that
+// the origin header requested to sync to, produced a chain with a bad block.
+type badBlockFn func(invalid *types.Header, origin *types.Header)
 
 // headerTask is a set of downloaded headers to queue along with their precomputed
 // hashes to avoid constant rehashing.
@@ -112,6 +117,7 @@ type Downloader struct {
 
 	// Callbacks
 	dropPeer peerDropFn // Drops a peer for misbehaving
+	badBlock badBlockFn // Reports a block as rejected by the chain
 
 	// Status
 	synchroniseMock func(id string, hash common.Hash) error // Replacement for synchronise during testing
@@ -130,7 +136,6 @@ type Downloader struct {
 	pivotHeader *types.Header // Pivot block header to dynamically push the syncing state root
 	pivotLock   sync.RWMutex  // Lock protecting pivot header reads from updates
 
-	snapSync       bool         // Whether to run state sync over the snap protocol
 	SnapSyncer     *snap.Syncer // TODO(karalabe): make private! hack for now
 	stateSyncStart chan *stateSync
 
@@ -357,9 +362,9 @@ func (d *Downloader) LegacySync(id string, head common.Hash, td, ttd *big.Int, m
 // checks fail an error will be returned. This method is synchronous
 func (d *Downloader) synchronise(id string, hash common.Hash, td, ttd *big.Int, mode SyncMode, beaconMode bool, beaconPing chan struct{}) error {
 	// The beacon header syncer is async. It will start this synchronization and
-	// will continue doing other tasks. However, if synchornization needs to be
+	// will continue doing other tasks. However, if synchronization needs to be
 	// cancelled, the syncer needs to know if we reached the startup point (and
-	// inited the cancel cannel) or not yet. Make sure that we'll signal even in
+	// inited the cancel channel) or not yet. Make sure that we'll signal even in
 	// case of a failure.
 	if beaconPing != nil {
 		defer func() {
@@ -472,12 +477,33 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td, ttd *
 		}
 	} else {
 		// In beacon mode, user the skeleton chain to retrieve the headers from
-		latest, err = d.skeleton.Head()
+		latest, _, err = d.skeleton.Bounds()
 		if err != nil {
 			return err
 		}
 		if latest.Number.Uint64() > uint64(fsMinFullBlocks) {
-			pivot = d.skeleton.Header(latest.Number.Uint64() - uint64(fsMinFullBlocks))
+			number := latest.Number.Uint64() - uint64(fsMinFullBlocks)
+
+			// Retrieve the pivot header from the skeleton chain segment but
+			// fallback to local chain if it's not found in skeleton space.
+			if pivot = d.skeleton.Header(number); pivot == nil {
+				_, oldest, _ := d.skeleton.Bounds() // error is already checked
+				if number < oldest.Number.Uint64() {
+					count := int(oldest.Number.Uint64() - number) // it's capped by fsMinFullBlocks
+					headers := d.readHeaderRange(oldest, count)
+					if len(headers) == count {
+						pivot = headers[len(headers)-1]
+						log.Warn("Retrieved pivot header from local", "number", pivot.Number, "hash", pivot.Hash(), "latest", latest.Number, "oldest", oldest.Number)
+					}
+				}
+			}
+			// Print an error log and return directly in case the pivot header
+			// is still not found. It means the skeleton chain is not linked
+			// correctly with local chain.
+			if pivot == nil {
+				log.Error("Pivot header is not found", "number", number)
+				return errNoPivotHeader
+			}
 		}
 	}
 	// If no pivot block was returned, the head is below the min full block
@@ -498,7 +524,10 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td, ttd *
 		}
 	} else {
 		// In beacon mode, use the skeleton chain for the ancestor lookup
-		origin = d.findBeaconAncestor()
+		origin, err = d.findBeaconAncestor()
+		if err != nil {
+			return err
+		}
 	}
 	d.syncStatsLock.Lock()
 	if d.syncStatsChainHeight <= origin || d.syncStatsChainOrigin > origin {
@@ -1374,23 +1403,25 @@ func (d *Downloader) processHeaders(origin uint64, td, ttd *big.Int, beaconMode 
 							}
 						}
 					}
-					if n, err := d.lightchain.InsertHeaderChain(chunkHeaders, frequency); err != nil {
-						rollbackErr = err
+					if len(chunkHeaders) > 0 {
+						if n, err := d.lightchain.InsertHeaderChain(chunkHeaders, frequency); err != nil {
+							rollbackErr = err
 
-						// If some headers were inserted, track them as uncertain
-						if (mode == SnapSync || frequency > 1) && n > 0 && rollback == 0 {
-							rollback = chunkHeaders[0].Number.Uint64()
+							// If some headers were inserted, track them as uncertain
+							if (mode == SnapSync || frequency > 1) && n > 0 && rollback == 0 {
+								rollback = chunkHeaders[0].Number.Uint64()
+							}
+							log.Warn("Invalid header encountered", "number", chunkHeaders[n].Number, "hash", chunkHashes[n], "parent", chunkHeaders[n].ParentHash, "err", err)
+							return fmt.Errorf("%w: %v", errInvalidChain, err)
 						}
-						log.Warn("Invalid header encountered", "number", chunkHeaders[n].Number, "hash", chunkHashes[n], "parent", chunkHeaders[n].ParentHash, "err", err)
-						return fmt.Errorf("%w: %v", errInvalidChain, err)
-					}
-					// All verifications passed, track all headers within the alloted limits
-					if mode == SnapSync {
-						head := chunkHeaders[len(chunkHeaders)-1].Number.Uint64()
-						if head-rollback > uint64(fsHeaderSafetyNet) {
-							rollback = head - uint64(fsHeaderSafetyNet)
-						} else {
-							rollback = 1
+						// All verifications passed, track all headers within the allowed limits
+						if mode == SnapSync {
+							head := chunkHeaders[len(chunkHeaders)-1].Number.Uint64()
+							if head-rollback > uint64(fsHeaderSafetyNet) {
+								rollback = head - uint64(fsHeaderSafetyNet)
+							} else {
+								rollback = 1
+							}
 						}
 					}
 					if len(rejected) != 0 {
@@ -1430,7 +1461,7 @@ func (d *Downloader) processHeaders(origin uint64, td, ttd *big.Int, beaconMode 
 			}
 			d.syncStatsLock.Unlock()
 
-			// Signal the content downloaders of the availablility of new tasks
+			// Signal the content downloaders of the availability of new tasks
 			for _, ch := range []chan bool{d.queue.blockWakeCh, d.queue.receiptWakeCh} {
 				select {
 				case ch <- true:
@@ -1502,7 +1533,7 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 		return errCancelContentProcessing
 	default:
 	}
-	// Retrieve the a batch of results to import
+	// Retrieve a batch of results to import
 	first, last := results[0].Header, results[len(results)-1].Header
 	log.Debug("Inserting downloaded chain", "items", len(results),
 		"firstnum", first.Number, "firsthash", first.Hash(),
@@ -1518,6 +1549,16 @@ func (d *Downloader) importBlockResults(results []*fetchResult) error {
 	if index, err := d.blockchain.InsertChain(blocks); err != nil {
 		if index < len(results) {
 			log.Debug("Downloaded item processing failed", "number", results[index].Header.Number, "hash", results[index].Header.Hash(), "err", err)
+
+			// In post-merge, notify the engine API of encountered bad chains
+			if d.badBlock != nil {
+				head, _, err := d.skeleton.Bounds()
+				if err != nil {
+					log.Error("Failed to retrieve beacon bounds for bad block reporting", "err", err)
+				} else {
+					d.badBlock(blocks[index].Header(), head)
+				}
+			}
 		} else {
 			// The InsertChain method in blockchain.go will sometimes return an out-of-bounds index,
 			// when it needs to preprocess blocks to import a sidechain.
@@ -1749,4 +1790,26 @@ func (d *Downloader) DeliverSnapPacket(peer *snap.Peer, packet snap.Packet) erro
 	default:
 		return fmt.Errorf("unexpected snap packet type: %T", packet)
 	}
+}
+
+// readHeaderRange returns a list of headers, using the given last header as the base,
+// and going backwards towards genesis. This method assumes that the caller already has
+// placed a reasonable cap on count.
+func (d *Downloader) readHeaderRange(last *types.Header, count int) []*types.Header {
+	var (
+		current = last
+		headers []*types.Header
+	)
+	for {
+		parent := d.lightchain.GetHeaderByHash(current.ParentHash)
+		if parent == nil {
+			break // The chain is not continuous, or the chain is exhausted
+		}
+		headers = append(headers, parent)
+		if len(headers) >= count {
+			break
+		}
+		current = parent
+	}
+	return headers
 }

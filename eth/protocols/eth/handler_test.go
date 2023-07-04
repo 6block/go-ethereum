@@ -1,4 +1,4 @@
-// Copyright 2015 The go-ethereum Authors
+// Copyright 2020 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
 // The go-ethereum library is free software: you can redistribute it and/or modify
@@ -94,7 +94,7 @@ func (b *testBackend) Chain() *core.BlockChain { return b.chain }
 func (b *testBackend) TxPool() TxPool          { return b.txpool }
 
 func (b *testBackend) RunPeer(peer *Peer, handler Handler) error {
-	// Normally the backend would do peer mainentance and handshakes. All that
+	// Normally the backend would do peer maintenance and handshakes. All that
 	// is omitted and we will just give control back to the handler.
 	return handler(peer)
 }
